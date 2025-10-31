@@ -71,6 +71,12 @@ if %errorlevel% NEQ 0 (
 REM === Set bot token (your token) ===
 set "BOT_TOKEN=7964488864:AAEVEbs9zWzipTgNR3HMIKAw1pR6Hpg8qyM"
 
+REM Список супер-админов (ID через запятую):
+set "BOT_SUPER_ADMINS=375196544"
+
+REM Список обычных админов (ID через запятую):
+set "BOT_ADMINS=7519364639"
+
 REM === Run bot ===
 echo [INFO] Запускаю бота...
 python bot.py

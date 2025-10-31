@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Optional, Set, Dict, Any
+from typing import Optional, Dict, Any, Set, Tuple
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
@@ -23,14 +23,13 @@ LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger("video_circle_bot")
 
-# ---------- КОНСТАНТЫ И ПУТИ ----------
+# ---------- ПУТИ/ХРАНИЛИЩЕ ----------
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 ACCESS_FILE = DATA_DIR / "access.json"
 SAVE_LOCK = asyncio.Lock()
 
-# Админы задаются через переменную окружения BOT_ADMINS: "12345,67890"
-def _parse_admins(env: Optional[str]) -> Set[int]:
+def _parse_ids(env: Optional[str]) -> Set[int]:
     ids: Set[int] = set()
     if not env:
         return ids
@@ -44,7 +43,99 @@ def _parse_admins(env: Optional[str]) -> Set[int]:
             pass
     return ids
 
-ADMINS: Set[int] = _parse_admins(os.environ.get("BOT_ADMINS"))
+def _empty_access() -> Dict[str, Any]:
+    # username — без @, в нижнем регистре
+    return {
+        "super": {"ids": [], "usernames": []},
+        "admins": {"ids": [], "usernames": []},
+    }
+
+def _normalize_access(d: Dict[str, Any]) -> Dict[str, Any]:
+    def norm_block(b: Dict[str, Any]) -> Dict[str, Any]:
+        # ids -> ints уникальные
+        ids = set()
+        for v in b.get("ids", []):
+            try:
+                ids.add(int(v))
+            except Exception:
+                pass
+        # usernames -> строки без @, lower
+        unames = {str(u).lstrip("@").lower() for u in b.get("usernames", []) if u}
+        return {"ids": sorted(ids), "usernames": sorted(unames)}
+
+    if not isinstance(d, dict):
+        return _empty_access()
+    d.setdefault("super", {})
+    d.setdefault("admins", {})
+    d["super"] = norm_block(d["super"])
+    d["admins"] = norm_block(d["admins"])
+    return d
+
+def _load_access() -> Dict[str, Any]:
+    if not ACCESS_FILE.exists():
+        # первичное заполнение из переменных окружения
+        acc = _empty_access()
+        super_ids = _parse_ids(os.environ.get("BOT_SUPER_ADMINS"))
+        admin_ids = _parse_ids(os.environ.get("BOT_ADMINS"))
+        acc["super"]["ids"] = sorted(super_ids)
+        acc["admins"]["ids"] = sorted(admin_ids)
+        return acc
+    try:
+        data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        data = _empty_access()
+    return _normalize_access(data)
+
+async def _save_access(data: Dict[str, Any]) -> None:
+    async with SAVE_LOCK:
+        ACCESS_FILE.write_text(
+            json.dumps(_normalize_access(data), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+# ---------- РОЛИ/ПРАВА ----------
+def _user_username_norm(m: Message) -> Optional[str]:
+    u = m.from_user
+    if not u or not u.username:
+        return None
+    return u.username.lstrip("@").lower()
+
+def _in_block(m: Message, block: Dict[str, Any]) -> bool:
+    uid = m.from_user.id
+    uname = _user_username_norm(m)
+    if uid in set(block.get("ids", [])):
+        return True
+    if uname and (uname in set(block.get("usernames", []))):
+        return True
+    return False
+
+def is_super(m: Message, access: Dict[str, Any]) -> bool:
+    return _in_block(m, access.get("super", {}))
+
+def is_admin(m: Message, access: Dict[str, Any]) -> bool:
+    # супер-админ автоматически админ
+    return is_super(m, access) or _in_block(m, access.get("admins", {}))
+
+async def _ensure_admin_access_or_explain(m: Message) -> Tuple[bool, Dict[str, Any]]:
+    access = _load_access()
+    if is_admin(m, access):
+        return True, access
+    who = f"@{m.from_user.username}" if m.from_user.username else f"id:{m.from_user.id}"
+    await m.answer(
+        "⛔ Доступ запрещён.\n"
+        "Только админы могут пользоваться ботом.\n\n"
+        f"Ваш идентификатор: {who}"
+    )
+    return False, access
+
+def _require_super(func):
+    async def wrapper(m: Message, *args, **kwargs):
+        access = _load_access()
+        if not is_super(m, access):
+            await m.answer("⛔ Команда доступна только супер-админам.")
+            return
+        return await func(m, access, *args, **kwargs)
+    return wrapper
 
 # ---------- КЛАВИАТУРА ----------
 MAIN_KB = ReplyKeyboardMarkup(
@@ -55,81 +146,14 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ---------- ХРАНИЛИЩЕ ДОСТУПОВ ----------
-def _empty_access() -> Dict[str, Any]:
-    return {"usernames": [], "ids": []}
-
-def _load_access() -> Dict[str, Any]:
-    if not ACCESS_FILE.exists():
-        return _empty_access()
-    try:
-        data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return _empty_access()
-        # нормализуем
-        data.setdefault("usernames", [])
-        data.setdefault("ids", [])
-        # нижний регистр для @
-        data["usernames"] = sorted({str(u).lstrip("@").lower() for u in data["usernames"] if u})
-        # только int для ids
-        norm_ids = set()
-        for i in data["ids"]:
-            try:
-                norm_ids.add(int(i))
-            except Exception:
-                pass
-        data["ids"] = sorted(norm_ids)
-        return data
-    except Exception:
-        return _empty_access()
-
-async def _save_access(data: Dict[str, Any]) -> None:
-    async with SAVE_LOCK:
-        ACCESS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def _user_key(m: Message) -> Dict[str, Optional[str | int]]:
-    username = (m.from_user.username or "").strip()
-    uname_norm = username.lstrip("@").lower() if username else None
-    uid = m.from_user.id
-    return {"username": uname_norm, "id": uid}
-
-def _is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
-
-def _has_access(m: Message, access: Dict[str, Any]) -> bool:
-    u = _user_key(m)
-    if _is_admin(u["id"]):  # админам всегда можно
-        return True
-    # доступ по username
-    if u["username"] and u["username"] in set(access.get("usernames", [])):
-        return True
-    # доступ по id (на случай пользователей без username)
-    if u["id"] in set(access.get("ids", [])):
-        return True
-    return False
-
-async def _ensure_access_or_explain(m: Message) -> bool:
-    access = _load_access()
-    if _has_access(m, access):
-        return True
-    # вежливое сообщение
-    uname = f"@{m.from_user.username}" if m.from_user.username else None
-    who = uname or f"id:{m.from_user.id}"
-    await m.answer(
-        "⛔ Нет доступа.\n"
-        "Попросите администратора выдать доступ.\n\n"
-        f"Ваш идентификатор: {who}"
-    )
-    return False
-
-# ---------- FFmpeg КОНВЕРТАЦИЯ ----------
+# ---------- FFmpeg ----------
 async def ffmpeg_convert(src: Path, dst: Path) -> None:
-    # Без кавычек и min(): уменьшаем до 480 по большей стороне, дополняем паддингом до квадрата
+    # Без кавычек/min(): масштабируем с сохранением пропорций и дополняем паддингом до квадрата
     args = [
         "ffmpeg", "-y",
         "-i", str(src),
         "-vf", "scale=480:480:force_original_aspect_ratio=decrease,pad=480:480:(ow-iw)/2:(oh-ih)/2,setsar=1",
-        "-t", "59",  # можно увеличить/убрать при желании
+        "-t", "59",
         "-r", "30",
         "-c:v", "libx264", "-preset", "veryfast",
         "-profile:v", "main", "-level", "3.1",
@@ -142,19 +166,19 @@ async def ffmpeg_convert(src: Path, dst: Path) -> None:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    out, err = await proc.communicate()
+    _, err = await proc.communicate()
     if proc.returncode != 0:
-        err_txt = err.decode("utf-8", "ignore")
-        raise RuntimeError(err_txt or "ffmpeg failed")
+        raise RuntimeError(err.decode("utf-8", "ignore") or "ffmpeg failed")
 
-# ---------- РАБОТА С МЕДИА ----------
+# ---------- МЕДИА ----------
 async def download_media(bot: Bot, file_id: str, dst: Path) -> None:
     f = await bot.get_file(file_id)
     log.info("Downloading: %s -> %s", f.file_path, dst)
     await bot.download_file(f.file_path, dst)
 
 async def handle_video(message: Message, file_id: str, original_name: Optional[str]) -> None:
-    if not await _ensure_access_or_explain(message):
+    ok, _ = await _ensure_admin_access_or_explain(message)
+    if not ok:
         return
 
     bot: Bot = message.bot
@@ -174,116 +198,135 @@ async def handle_video(message: Message, file_id: str, original_name: Optional[s
             log.exception("Failed to process video")
             await message.answer(f"⚠️ Ошибка: {e}")
 
-# ---------- КОМАНДЫ АДМИНИСТРАТОРА ----------
-def _require_admin(func):
-    async def wrapper(m: Message, *args, **kwargs):
-        if not _is_admin(m.from_user.id):
-            await m.answer("⛔ Эта команда доступна только администраторам.")
-            return
-        return await func(m, *args, **kwargs)
-    return wrapper
-
-@_require_admin
-async def cmd_grant(m: Message):
-    """
-    /grant @username  — выдать доступ по тегу
-    /grant_id 123456  — выдать доступ по ID (если у пользователя нет username)
-    """
-    text = m.text.strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer("Использование:\n/grant @username")
-        return
-    username = parts[1].strip().lstrip("@").lower()
-    if not username:
-        await m.answer("Укажи тег: /grant @username")
-        return
-    data = _load_access()
-    uset = set(data.get("usernames", []))
-    uset.add(username)
-    data["usernames"] = sorted(uset)
-    await _save_access(data)
-    await m.answer(f"✅ Доступ выдан: @{username}")
-
-@_require_admin
-async def cmd_revoke(m: Message):
-    text = m.text.strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer("Использование:\n/revoke @username")
-        return
-    username = parts[1].strip().lstrip("@").lower()
-    data = _load_access()
-    uset = set(data.get("usernames", []))
-    if username in uset:
-        uset.remove(username)
-        data["usernames"] = sorted(uset)
-        await _save_access(data)
-        await m.answer(f"✅ Доступ отозван: @{username}")
-    else:
-        await m.answer(f"Пользователь @{username} не найден в списке доступа.")
-
-@_require_admin
-async def cmd_grant_id(m: Message):
-    text = m.text.strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer("Использование:\n/grant_id 123456789")
-        return
+# ---------- КОМАНДЫ СУПЕР-АДМИНА ----------
+def _parse_target(arg: str) -> Tuple[Optional[int], Optional[str]]:
+    arg = arg.strip()
+    if not arg:
+        return None, None
+    if arg.startswith("@"):
+        return None, arg.lstrip("@").lower()
     try:
-        uid = int(parts[1].strip())
+        return int(arg), None
     except ValueError:
-        await m.answer("ID должен быть числом: /grant_id 123456789")
-        return
-    data = _load_access()
-    ids = set(int(x) for x in data.get("ids", []))
-    ids.add(uid)
-    data["ids"] = sorted(ids)
-    await _save_access(data)
-    await m.answer(f"✅ Доступ по ID выдан: {uid}")
+        # может прислали просто username без @
+        return None, arg.lower()
 
-@_require_admin
-async def cmd_revoke_id(m: Message):
-    text = m.text.strip()
-    parts = text.split(maxsplit=1)
+@_require_super
+async def cmd_grant_admin(m: Message, access: Dict[str, Any]):
+    """ /grant_admin @username | /grant_admin 123456 """
+    parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
-        await m.answer("Использование:\n/revoke_id 123456789")
+        await m.answer("Использование: /grant_admin @username | /grant_admin <id>")
         return
-    try:
-        uid = int(parts[1].strip())
-    except ValueError:
-        await m.answer("ID должен быть числом: /revoke_id 123456789")
+    uid, uname = _parse_target(parts[1])
+    if uid is None and not uname:
+        await m.answer("Укажи @username или числовой ID.")
         return
-    data = _load_access()
-    ids = set(int(x) for x in data.get("ids", []))
-    if uid in ids:
-        ids.remove(uid)
-        data["ids"] = sorted(ids)
-        await _save_access(data)
-        await m.answer(f"✅ Доступ по ID отозван: {uid}")
-    else:
-        await m.answer(f"ID {uid} не найден в списке доступа.")
 
-@_require_admin
-async def cmd_list_access(m: Message):
-    data = _load_access()
-    users = data.get("usernames", [])
-    ids = data.get("ids", [])
-    txt = "📜 Список доступа:\n"
-    if users:
-        txt += "\nТеги:\n" + "\n".join(f"• @{u}" for u in users)
-    else:
-        txt += "\nТеги: —"
-    if ids:
-        txt += "\n\nID:\n" + "\n".join(f"• {i}" for i in ids)
-    else:
-        txt += "\n\nID: —"
-    await m.answer(txt)
+    admins = access["admins"]
+    if uid is not None:
+        admins["ids"] = sorted(set(admins["ids"]) | {uid})
+    if uname:
+        admins["usernames"] = sorted(set(admins["usernames"]) | {uname})
+
+    await _save_access(access)
+    who = f"@{uname}" if uname else uid
+    await m.answer(f"✅ Выдан доступ АДМИНА: {who}")
+
+@_require_super
+async def cmd_revoke_admin(m: Message, access: Dict[str, Any]):
+    """ /revoke_admin @username | /revoke_admin 123456 """
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: /revoke_admin @username | /revoke_admin <id>")
+        return
+    uid, uname = _parse_target(parts[1])
+    admins = access["admins"]
+    if uid is not None:
+        admins["ids"] = sorted({i for i in admins["ids"] if i != uid})
+    if uname:
+        admins["usernames"] = sorted({u for u in admins["usernames"] if u != uname})
+
+    await _save_access(access)
+    who = f"@{uname}" if uname else uid
+    await m.answer(f"✅ Отозван доступ АДМИНА: {who}")
+
+@_require_super
+async def cmd_grant_super(m: Message, access: Dict[str, Any]):
+    """ /grant_super @username | /grant_super 123456 """
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: /grant_super @username | /grant_super <id>")
+        return
+    uid, uname = _parse_target(parts[1])
+
+    sup = access["super"]
+    if uid is not None:
+        sup["ids"] = sorted(set(sup["ids"]) | {uid})
+    if uname:
+        sup["usernames"] = sorted(set(sup["usernames"]) | {uname})
+
+    await _save_access(access)
+    who = f"@{uname}" if uname else uid
+    await m.answer(f"✅ Выдан доступ СУПЕР-АДМИНА: {who}")
+
+@_require_super
+async def cmd_revoke_super(m: Message, access: Dict[str, Any]):
+    """ /revoke_super @username | /revoke_super 123456 """
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: /revoke_super @username | /revoke_super <id>")
+        return
+    uid, uname = _parse_target(parts[1])
+
+    # Защита: не позволяем убрать последнего супер-админа
+    def count_sup(a: Dict[str, Any]) -> int:
+        return len(a["super"]["ids"]) + len(a["super"]["usernames"])
+
+    before = count_sup(access)
+    sup = access["super"]
+
+    if uid is not None:
+        sup["ids"] = sorted({i for i in sup["ids"] if i != uid})
+    if uname:
+        sup["usernames"] = sorted({u for u in sup["usernames"] if u != uname})
+
+    if count_sup(access) == 0:
+        await m.answer("⛔ Нельзя удалить последнего супер-админа.")
+        return
+
+    await _save_access(access)
+    who = f"@{uname}" if uname else uid
+    await m.answer(f"✅ Отозван доступ СУПЕР-АДМИНА: {who}")
+
+@_require_super
+async def cmd_list_roles(m: Message, access: Dict[str, Any]):
+    s = access["super"]
+    a = access["admins"]
+    txt = ["📜 Роли доступа:"]
+    txt.append("\n🔶 Супер-админы:")
+    lines = []
+    if s["usernames"]:
+        lines += [f"  • @{u}" for u in s["usernames"]]
+    if s["ids"]:
+        lines += [f"  • {i}" for i in s["ids"]]
+    txt += lines or ["  —"]
+
+    txt.append("\n🔹 Админы:")
+    lines = []
+    if a["usernames"]:
+        lines += [f"  • @{u}" for u in a["usernames"]]
+    if a["ids"]:
+        lines += [f"  • {i}" for i in a["ids"]]
+    txt += lines or ["  —"]
+
+    await m.answer("\n".join(txt))
 
 async def cmd_whoami(m: Message):
-    u = m.from_user
-    uname = f"@{u.username}" if u.username else "(нет username)"
-    await m.answer(f"Вы: {uname}\nID: {u.id}\nАдмин: {'да' if _is_admin(u.id) else 'нет'}")
+    acc = _load_access()
+    role = "супер-админ" if is_super(m, acc) else ("админ" if is_admin(m, acc) else "нет доступа")
+    uname = f"@{m.from_user.username}" if m.from_user.username else "(нет username)"
+    await m.answer(f"Вы: {uname}\nID: {m.from_user.id}\nРоль: {role}")
 
 # ---------- MAIN ----------
 async def main() -> None:
@@ -293,12 +336,15 @@ async def main() -> None:
     bot = Bot(token)
     dp = Dispatcher()
 
-    # Базовые команды
+    # базовые
     @dp.message(Command("start", "help"))
     async def start(m: Message):
         await m.answer(
-            "Отправь видео — сделаю кружок Telegram.\n"
-            "Доступ выдают админы. Команды админа: /grant, /revoke, /grant_id, /revoke_id, /list_access",
+            "Отправь видео — сделаю кружок Telegram.\n\n"
+            "Роли:\n"
+            "• Супер-админ — команды и конвертация\n"
+            "• Админ — только конвертация\n"
+            "• Остальным — доступ закрыт",
             reply_markup=MAIN_KB
         )
 
@@ -306,38 +352,30 @@ async def main() -> None:
     async def who(m: Message):
         await cmd_whoami(m)
 
-    # Админ-команды
-    @dp.message(Command("grant"))
-    async def _grant(m: Message):
-        await cmd_grant(m)
+    # команды СУПЕР-АДМИНА
+    @dp.message(Command("grant_admin"))
+    async def _ga(m: Message): await cmd_grant_admin(m)
+    @dp.message(Command("revoke_admin"))
+    async def _ra(m: Message): await cmd_revoke_admin(m)
+    @dp.message(Command("grant_super"))
+    async def _gs(m: Message): await cmd_grant_super(m)
+    @dp.message(Command("revoke_super"))
+    async def _rs(m: Message): await cmd_revoke_super(m)
+    @dp.message(Command("list_roles"))
+    async def _lr(m: Message): await cmd_list_roles(m)
 
-    @dp.message(Command("revoke"))
-    async def _revoke(m: Message):
-        await cmd_revoke(m)
-
-    @dp.message(Command("grant_id"))
-    async def _grant_id(m: Message):
-        await cmd_grant_id(m)
-
-    @dp.message(Command("revoke_id"))
-    async def _revoke_id(m: Message):
-        await cmd_revoke_id(m)
-
-    @dp.message(Command("list_access"))
-    async def _list(m: Message):
-        await cmd_list_access(m)
-
-    # Кнопки
-    @dp.message(F.text == "🎥 Конвертировать видео")
+    # кнопки
+    @dp.message(F.text == "🎥 Конвертировать видео"))
     async def ask(m: Message):
-        if await _ensure_access_or_explain(m):
+        ok, _ = await _ensure_admin_access_or_explain(m)
+        if ok:
             await m.answer("Жду видео или пересланное видео.", reply_markup=MAIN_KB)
 
     @dp.message(F.text == "ℹ️ Помощь")
     async def help_(m: Message):
-        await m.answer("Установи ffmpeg. Отправь видео — получишь видео-кружок. Доступ выдаёт админ.", reply_markup=MAIN_KB)
+        await m.answer("Установи ffmpeg. Доступ только для ролей (админ/супер-админ).", reply_markup=MAIN_KB)
 
-    # Медиа
+    # медиа
     @dp.message(F.video)
     async def vid(m: Message):
         await handle_video(m, m.video.file_id, m.video.file_name)
