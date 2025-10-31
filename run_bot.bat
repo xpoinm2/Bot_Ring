@@ -4,11 +4,30 @@ setlocal enabledelayedexpansion
 REM Ensure the script works relative to its own directory
 cd /d "%~dp0"
 
-REM Detect which Python interpreter the "py" launcher resolves to
-for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYTHON_EXE=%%i"
+REM Try to detect Python via the "py" launcher first
+set "PYTHON_EXE="
+set "PYTHON_SOURCE="
+for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do (
+    set "PYTHON_EXE=%%i"
+    set "PYTHON_SOURCE=py launcher"
+)
+
+REM Fall back to scanning the PATH for python.exe if the launcher is unavailable
+if not defined PYTHON_EXE (
+    for /f "delims=" %%i in ('where python 2^>nul') do (
+        echo %%i ^| findstr /I "inkscape" >nul
+        if errorlevel 1 (
+            set "PYTHON_EXE=%%i"
+            set "PYTHON_SOURCE=PATH"
+            goto AFTER_PY_DETECT
+        )
+    )
+)
+
+:AFTER_PY_DETECT
 
 if not defined PYTHON_EXE (
-    echo Не удалось выполнить команду "py -3".
+    echo Не удалось найти подходящий интерпретатор Python.
     echo Установите официальную версию Python с сайта https://www.python.org/downloads/ и убедитесь,
     echo что при установке была отмечена опция "Add Python to PATH".
     echo.
@@ -16,11 +35,14 @@ if not defined PYTHON_EXE (
 )
 
 echo Используется интерпретатор Python: !PYTHON_EXE!
+if /I "!PYTHON_SOURCE!"=="PATH" (
+    echo (обнаружен через команду "where python")
+)
 echo.
 
 echo !PYTHON_EXE! ^| findstr /I "inkscape" >nul
 if not errorlevel 1 (
-    echo Обнаружено, что команда py указывает на Python, встроенный в стороннее приложение.
+    echo Обнаружено, что найденный Python встроен в стороннее приложение.
     echo Такой Python не поставляется с готовыми колёсами для зависимостей вроде aiohttp, поэтому установка завершается ошибкой.
     echo.
     echo Установите официальную версию Python с сайта https://www.python.org/downloads/, отметьте опцию "Add Python to PATH"
@@ -32,7 +54,7 @@ if not errorlevel 1 (
 REM Create a virtual environment if it does not exist
 if not exist .venv (
     echo Создаю виртуальное окружение...
-    py -3 -m venv .venv
+    "!PYTHON_EXE!" -m venv .venv
     if errorlevel 1 goto END
 )
 
