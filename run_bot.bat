@@ -1,8 +1,14 @@
 @echo off
 setlocal enabledelayedexpansion
 
+set "SCRIPT_DIR=%~dp0"
+if not defined SCRIPT_DIR (
+    echo Не удалось определить директорию скрипта.
+    goto END
+)
+
 REM Ensure the script works relative to its own directory
-cd /d "%~dp0"
+cd /d "%SCRIPT_DIR%"
 
 REM Try to detect Python via the "py" launcher first
 set "PYTHON_EXE="
@@ -77,15 +83,28 @@ if /I "!PYTHON_SOURCE!"=="PATH" (
 )
 echo.
 
+set "VENV_DIR=.venv"
+set "ACTIVATE_BAT=%VENV_DIR%\Scripts\activate.bat"
+
 REM Create a virtual environment if it does not exist
-if not exist .venv (
+if not exist "%VENV_DIR%" (
     echo Создаю виртуальное окружение...
-    "!PYTHON_EXE!" -m venv .venv
-    if errorlevel 1 goto END
+    "!PYTHON_EXE!" -m venv "%VENV_DIR%"
+    if errorlevel 1 (
+        echo Не удалось создать виртуальное окружение с помощью !PYTHON_EXE!.
+        echo Проверьте, что Python установлен корректно и перезапустите скрипт.
+        goto END
+    )
+)
+
+if not exist "%ACTIVATE_BAT%" (
+    echo Файл активации виртуального окружения не найден: %ACTIVATE_BAT%
+    echo Удалите папку %VENV_DIR% и запустите скрипт заново, чтобы пересоздать окружение.
+    goto END
 )
 
 REM Activate the virtual environment
-call .venv\Scripts\activate.bat
+call "%ACTIVATE_BAT%"
 if errorlevel 1 goto END
 
 REM Upgrade pip and install dependencies inside the virtual environment
