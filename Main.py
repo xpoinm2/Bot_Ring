@@ -8,8 +8,15 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ChatActions
+try:
+    from aiogram import Bot, Dispatcher, executor, types
+    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ChatActions
+except ModuleNotFoundError as exc:  # pragma: no cover - dependency missing during runtime
+    raise ModuleNotFoundError(
+        "Не удалось импортировать пакет 'aiogram'. "
+        "Установите зависимости командой 'python -m pip install -r requirements.txt' "
+        "или запустите скрипт run_bot.bat, который сделает это автоматически."
+    ) from exc
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "bot.log"
