@@ -1,153 +1,80 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
-set "SCRIPT_DIR=%~dp0"
-if not defined SCRIPT_DIR (
-    echo Не удалось определить директорию скрипта.
-    goto END
-)
+REM === Find a working Python ===
+set "PYCMD="
 
-REM Ensure the script works relative to its own directory
-cd /d "%SCRIPT_DIR%"
-
-REM Try to detect Python via the "py" launcher first
-set "PYTHON_EXE="
-set "PYTHON_SOURCE="
-for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do (
-    set "PYTHON_EXE=%%i"
-    set "PYTHON_SOURCE=py launcher"
-)
-
-REM Fall back to scanning the PATH for python.exe if the launcher is unavailable
-if not defined PYTHON_EXE (
-    for /f "delims=" %%i in ('where python 2^>nul') do (
-        echo %%i ^| findstr /I "inkscape" >nul
-        if errorlevel 1 (
-            set "PYTHON_EXE=%%i"
-            set "PYTHON_SOURCE=PATH"
-            goto AFTER_PY_DETECT
-        )
+REM 1) Prefer 'python' if present (your 3.13 should be here)
+where python >nul 2>nul
+if %errorlevel%==0 (
+  set "PYCMD=python"
+) else (
+  REM 2) Try py launcher with specific versions
+  for %%V in (3.13 3.12 3.11 3) do (
+    py -%%V -V >nul 2>nul
+    if !errorlevel! EQU 0 (
+      set "PYCMD=py -%%V"
+      goto :HAVE_PY
     )
+  )
 )
 
-:AFTER_PY_DETECT
-
-if not defined PYTHON_EXE (
-    call :LOCATE_OFFICIAL_PYTHON
+:HAVE_PY
+if not defined PYCMD (
+  echo [ERROR] Python не найден. Установи Python 3.11+ и добавь его в PATH.
+  echo         Или установи py-launcher и нормальную привязку версий.
+  pause
+  exit /b 1
 )
 
-if not defined PYTHON_EXE (
-    echo Не удалось найти подходящий интерпретатор Python.
-    echo Установите официальную версию Python с сайта https://www.python.org/downloads/ и убедитесь,
-    echo что при установке была отмечена опция "Add Python to PATH".
-    echo.
-    goto END
+REM === Create venv if needed ===
+if not exist ".venv" (
+  echo [INFO] Создаю виртуальное окружение .venv ...
+  %PYCMD% -m venv .venv
+  if %errorlevel% NEQ 0 (
+    echo [ERROR] Не удалось создать виртуальное окружение с помощью: %PYCMD%
+    echo         Проверь, что этот Python установлен корректно.
+    pause
+    exit /b 1
+  )
 )
 
-set "EMBEDDED_PYTHON="
-echo !PYTHON_EXE! ^| findstr /I "inkscape" >nul
-if not errorlevel 1 (
-    set "EMBEDDED_PYTHON=1"
+REM === Activate venv ===
+call ".venv\Scripts\activate.bat"
+if %errorlevel% NEQ 0 (
+  echo [ERROR] Не удалось активировать .venv
+  pause
+  exit /b 1
 )
 
-if defined EMBEDDED_PYTHON (
-    set "ORIGINAL_PYTHON=!PYTHON_EXE!"
-    call :LOCATE_OFFICIAL_PYTHON
-    if defined PYTHON_EXE (
-        echo Обнаружена установленная версия Python, которая подходит для установки зависимостей:
-        echo     !PYTHON_EXE!
-        set "PYTHON_SOURCE=auto-detected default install"
-        set "EMBEDDED_PYTHON="
-    ) else (
-        set "PYTHON_EXE=!ORIGINAL_PYTHON!"
-    )
-)
-
-if defined EMBEDDED_PYTHON (
-    echo Обнаружено, что найденный Python встроен в стороннее приложение.
-    echo Такой Python не поставляется с готовыми колёсами для зависимостей вроде aiohttp, поэтому установка завершается ошибкой.
-    echo.
-    echo Установите официальную версию Python с сайта https://www.python.org/downloads/, отметьте опцию "Add Python to PATH"
-    echo и запустите этот скрипт заново. Тогда виртуальное окружение будет создано автоматически.
-    echo.
-    goto END
-)
-
-echo Используется интерпретатор Python: !PYTHON_EXE!
-if /I "!PYTHON_SOURCE!"=="PATH" (
-    echo (обнаружен через команду "where python")
-) else if /I "!PYTHON_SOURCE!"=="auto-detected default install" (
-    echo (обнаружен в стандартной директории установки python.org)
-) else if /I "!PYTHON_SOURCE!"=="py launcher" (
-    echo (обнаружен через команду "py -3")
-)
-echo.
-
-set "VENV_DIR=.venv"
-set "ACTIVATE_BAT=%VENV_DIR%\Scripts\activate.bat"
-
-REM Create a virtual environment if it does not exist
-if not exist "%VENV_DIR%" (
-    echo Создаю виртуальное окружение...
-    "!PYTHON_EXE!" -m venv "%VENV_DIR%"
-    if errorlevel 1 (
-        echo Не удалось создать виртуальное окружение с помощью !PYTHON_EXE!.
-        echo Проверьте, что Python установлен корректно и перезапустите скрипт.
-        goto END
-    )
-)
-
-if not exist "%ACTIVATE_BAT%" (
-    echo Файл активации виртуального окружения не найден: %ACTIVATE_BAT%
-    echo Удалите папку %VENV_DIR% и запустите скрипт заново, чтобы пересоздать окружение.
-    goto END
-)
-
-REM Activate the virtual environment
-call "%ACTIVATE_BAT%"
-if errorlevel 1 goto END
-
-REM Upgrade pip and install dependencies inside the virtual environment
+REM === Upgrade pip and install deps ===
 python -m pip install --upgrade pip
-if errorlevel 1 goto END
-
-python -m pip install -r requirements.txt
-if errorlevel 1 goto END
-
-REM Run the bot
-python Main.py
-
-goto END
-
-:LOCATE_OFFICIAL_PYTHON
-set "OFFICIAL_PYTHON="
-if defined LocalAppData (
-    for /f "delims=" %%d in ('dir /b /ad /o-n "%LocalAppData%\Programs\Python" 2^>nul') do (
-        if "!OFFICIAL_PYTHON!"=="" (
-            if exist "%LocalAppData%\Programs\Python\%%d\python.exe" (
-                set "OFFICIAL_PYTHON=%LocalAppData%\Programs\Python\%%d\python.exe"
-            )
-        )
-    )
+if not exist requirements.txt (
+  echo aiogram^>=3.4,^<4> requirements.txt
+)
+pip install -r requirements.txt
+if %errorlevel% NEQ 0 (
+  echo [ERROR] Не удалось установить зависимости из requirements.txt
+  pause
+  exit /b 1
 )
 
-if "!OFFICIAL_PYTHON!"=="" if defined ProgramFiles (
-    for /f "delims=" %%d in ('dir /b /ad /o-n "%ProgramFiles%\Python*" 2^>nul') do (
-        if "!OFFICIAL_PYTHON!"=="" (
-            if exist "%ProgramFiles%\%%d\python.exe" (
-                set "OFFICIAL_PYTHON=%ProgramFiles%\%%d\python.exe"
-            )
-        )
-    )
+REM === Check ffmpeg ===
+where ffmpeg >nul 2>nul
+if %errorlevel% NEQ 0 (
+  echo [WARN] ffmpeg не найден в PATH. Установи ffmpeg и перезапусти.
+  pause
+  exit /b 1
 )
 
-if not "!OFFICIAL_PYTHON!"=="" (
-    set "PYTHON_EXE=!OFFICIAL_PYTHON!"
-    set "PYTHON_SOURCE=auto-detected default install"
-)
+REM === Set bot token (your token) ===
+set "BOT_TOKEN=7964488864:AAEVEbs9zWzipTgNR3HMIKAw1pR6Hpg8qyM"
 
-exit /b
+REM === Run bot ===
+echo [INFO] Запускаю бота...
+python bot.py
 
-:END
 echo.
+echo [INFO] Бот завершил работу. Нажмите любую клавишу для выхода.
 pause
