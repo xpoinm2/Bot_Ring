@@ -13,3 +13,6 @@ pip install -r requirements.txt
 
 REM Run the bot
 python Main.py
+
+REM Keep the console window open after execution
+pause

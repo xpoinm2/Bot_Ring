@@ -4,14 +4,29 @@ import os
 import shlex
 import subprocess
 import tempfile
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ChatActions
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "bot.log"
 
+LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s - %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    datefmt=DATE_FORMAT,
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=5, encoding="utf-8"),
+    ],
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -77,10 +92,14 @@ async def convert_to_video_note(source_path: Path, destination_path: Path) -> No
         logger.error("ffmpeg error: %s", process.stderr)
         raise RuntimeError("Не удалось сконвертировать видео. Убедитесь, что установлен ffmpeg.")
 
+    logger.info("Conversion finished successfully: %s", destination_path)
+
 
 async def download_media(file_id: str, destination: Path) -> None:
+    logger.info("Downloading file %s to %s", file_id, destination)
     file = await bot.get_file(file_id)
     await bot.download_file(file.file_path, destination)
+    logger.info("Download completed: %s", destination)
 
 
 async def handle_video(message: types.Message, file_id: str, original_file_name: Optional[str]) -> None:
@@ -92,15 +111,18 @@ async def handle_video(message: types.Message, file_id: str, original_file_name:
         source_path = tmp_dir_path / f"source{source_suffix}"
         converted_path = tmp_dir_path / "converted.mp4"
 
+        logger.info("Processing video for chat %s", message.chat.id)
         await download_media(file_id, source_path)
 
         try:
             await convert_to_video_note(source_path, converted_path)
         except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to convert video note")
             await message.answer(str(exc))
             return
 
         await message.answer_video_note(types.InputFile(converted_path))
+        logger.info("Video note sent to chat %s", message.chat.id)
 
 
 @dp.message_handler(commands=["start", "help"])
