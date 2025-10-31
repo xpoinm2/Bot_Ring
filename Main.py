@@ -3,6 +3,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -12,11 +13,21 @@ try:
     from aiogram import Bot, Dispatcher, executor, types
     from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ChatActions
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency missing during runtime
-    raise ModuleNotFoundError(
+    guidance = (
         "Не удалось импортировать пакет 'aiogram'. "
         "Установите зависимости командой 'python -m pip install -r requirements.txt' "
         "или запустите скрипт run_bot.bat, который сделает это автоматически."
-    ) from exc
+    )
+
+    if sys.platform.startswith("win") and "inkscape" in sys.executable.lower():
+        guidance += (
+            "\n\nОбнаружено, что скрипт запущен через встроенный Python стороннего приложения "
+            "(например, Inkscape). Установите официальную версию Python с сайта python.org "
+            "и запустите run_bot.bat заново — это создаст виртуальное окружение с нужными"
+            " зависимостями без необходимости собирать их из исходников."
+        )
+
+    raise ModuleNotFoundError(guidance) from exc
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "bot.log"
